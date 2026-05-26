@@ -6620,7 +6620,7 @@ void cyanide_present_contact(UIViewController *host)
             case RootSectionActions:
                 indexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:SectionActions];
                 break;
-            case case RootSectionTweakBundles:
+            case RootSectionTweakBundles:
             case RootSectionSystemBundles: {
                 NSArray<NSDictionary *> *bundles = (RootSection)indexPath.section == RootSectionTweakBundles
                     ? self.tweakBundleRows : self.systemBundleRows;
