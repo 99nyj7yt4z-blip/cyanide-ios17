@@ -4051,8 +4051,86 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
     } else {
         appInfo = self.apps[indexPath.row];
     }
-    [self fetchDowngradeDataForApp:appInfo];
+    
+    UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:@"Downgrade Method" 
+                                                                         message:@"Choose how to get the version ID" 
+                                                                  preferredStyle:UIAlertControllerStyleActionSheet];
+    
+    [actionSheet addAction:[UIAlertAction actionWithTitle:@"Fetch from Server" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self fetchDowngradeDataForApp:appInfo];
+    }]];
+    
+    [actionSheet addAction:[UIAlertAction actionWithTitle:@"Custom Version ID" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self promptForCustomVersionForApp:appInfo];
+    }]];
+    
+    [actionSheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    
+    if ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad && actionSheet.popoverPresentationController) {
+        UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+        actionSheet.popoverPresentationController.sourceView = cell;
+        actionSheet.popoverPresentationController.sourceRect = cell.bounds;
+    }
+    
+    [self presentViewController:actionSheet animated:YES completion:nil];
 }
+
+- (void)promptForCustomVersionForApp:(NSDictionary *)appInfo {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Custom Version ID" 
+                                                                   message:@"Enter the numeric AppExtVrsId for the version:\ne.g., 843219482" 
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.placeholder = @"Version ID";
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Downgrade" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        NSString *customVersion = alert.textFields.firstObject.text;
+        if (customVersion.length > 0) {
+            [self executeCustomDowngradeWithAppInfo:appInfo versionId:customVersion];
+        }
+    }]];
+    
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)executeCustomDowngradeWithAppInfo:(NSDictionary *)appInfo versionId:(NSString *)versionId {
+    NSString *bundleId = appInfo[@"CFBundleIdentifier"];
+    NSString *appName = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: bundleId;
+    
+    UIAlertController *loadingAlert = [UIAlertController alertControllerWithTitle:@"Preparing" 
+                                                                          message:[NSString stringWithFormat:@"Fetching Track ID for %@...", appName] 
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+    
+    [self presentViewController:loadingAlert animated:YES completion:^{
+        [self downgrade_fetchTrackIDForBundleID:bundleId completion:^(long long trackId, NSError *err) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [loadingAlert dismissViewControllerAnimated:YES completion:^{
+                    if (err || trackId == 0) {
+                        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Failed" 
+                                                                                          message:err.localizedDescription ?: @"Could not fetch the Track ID for this app." 
+                                                                                   preferredStyle:UIAlertControllerStyleAlert];
+                        [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                        [self presentViewController:errAlert animated:YES completion:nil];
+                        return;
+                    }
+                    
+                    NSString *trackIdStr = [NSString stringWithFormat:@"%lld", trackId];
+                    InstallProgressViewController *logVC = [[InstallProgressViewController alloc] init];
+                    UINavigationController *logNav = [[UINavigationController alloc] initWithRootViewController:logVC];
+                    logNav.modalPresentationStyle = UIModalPresentationAutomatic;
+                    
+                    [self presentViewController:logNav animated:YES completion:^{
+                        downgrade_trigger_in_springboard(trackIdStr, versionId);
+                    }];
+                }];
+            });
+        }];
+    }];
+}
+
 @end
 
 @interface BlockUpdatesViewController : UITableViewController <UISearchResultsUpdating>
