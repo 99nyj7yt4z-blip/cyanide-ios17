@@ -4059,6 +4059,8 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
 @property (nonatomic, strong) NSArray<NSDictionary *> *apps;
 @property (nonatomic, strong) NSArray<NSDictionary *> *filteredApps;
 @property (nonatomic, strong) UISearchController *searchController;
+// 👇 新增这个属性来存储等待处理的App
+@property (nonatomic, strong) NSMutableSet<NSString *> *waitingApps; 
 @end
 
 @implementation BlockUpdatesViewController
@@ -4067,7 +4069,9 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
     [super viewDidLoad];
     self.title = @"Block App Updates";
     self.tableView.rowHeight = 60;
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(loadApps)];
+    self.waitingApps = [NSMutableSet set];
+// 右上角按钮改为 Done
+self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Done" style:UIBarButtonItemStyleDone target:self action:@selector(commitUpdates)];
     
     self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
     self.searchController.searchResultsUpdater = self;
@@ -4182,12 +4186,17 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
         NSString *placeholderPath = [appGroupPath stringByAppendingPathComponent:@"com.apple.mobileinstallation.placeholder"];
         
         BOOL isBlocked = (access(placeholderPath.UTF8String, F_OK) == 0) || [[NSFileManager defaultManager] fileExistsAtPath:placeholderPath];
+        NSString *bundleId = appInfo[@"CFBundleIdentifier"];
         
-        if (isBlocked) {
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@  (Blocked 🚫)", appInfo[@"CFBundleIdentifier"]];
+        // 👇 优先判断是否在等待队列中
+        if ([self.waitingApps containsObject:bundleId]) {
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@  (Waiting...)", bundleId];
+            cell.detailTextLabel.textColor = [UIColor systemOrangeColor];
+        } else if (isBlocked) {
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@  (Blocked 🚫)", bundleId];
             cell.detailTextLabel.textColor = [UIColor systemRedColor];
         } else {
-            cell.detailTextLabel.text = appInfo[@"CFBundleIdentifier"];
+            cell.detailTextLabel.text = bundleId;
             cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
         }
     } else {
@@ -4239,19 +4248,32 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
     return cell;
 }
 
+// 👇 将上面删除的部分替换为这段新代码 👇
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     
     NSDictionary *appInfo = [self isFiltering] ? self.filteredApps[indexPath.row] : self.apps[indexPath.row];
-    NSString *bundlePath = appInfo[@"AppBundlePath"];
-    if (!bundlePath) return;
+    NSString *bundleId = appInfo[@"CFBundleIdentifier"];
+    if (!bundleId) return;
     
-    NSString *appName = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: appInfo[@"CFBundleIdentifier"];
+    // 切换等待状态：如果已经在队列中就移除，不在就加入
+    if ([self.waitingApps containsObject:bundleId]) {
+        [self.waitingApps removeObject:bundleId];
+    } else {
+        [self.waitingApps addObject:bundleId];
+    }
     
-    NSString *appGroupPath = [bundlePath stringByDeletingLastPathComponent];
-    NSString *placeholderPath = [appGroupPath stringByAppendingPathComponent:@"com.apple.mobileinstallation.placeholder"];
-    
-    BOOL isBlocked = (access(placeholderPath.UTF8String, F_OK) == 0) || [[NSFileManager defaultManager] fileExistsAtPath:placeholderPath];
+    // 给一点震动反馈并刷新当前行的UI状态
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [feedback impactOccurred];
+    [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationFade];
+}
+
+
+// 👇 在 tableView:didSelectRowAtIndexPath: 方法和 @end 之间，粘贴这段全新的方法 👇
+- (void)commitUpdates {
+    // 如果用户没选任何App，直接返回
+    if (self.waitingApps.count == 0) return;
     
     InstallProgressViewController *logVC = [[InstallProgressViewController alloc] init];
     UINavigationController *logNav = [[UINavigationController alloc] initWithRootViewController:logVC];
@@ -4260,11 +4282,10 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
     [self presentViewController:logNav animated:YES completion:^{
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
             log_session_begin();
-            log_user("[BLOCK] Target app: %s\n", appName.UTF8String);
-            log_user("[BLOCK] Target path: %s\n", placeholderPath.UTF8String);
+            log_user("[BLOCK] Preparing to process %lu app(s).\n", (unsigned long)self.waitingApps.count);
             
             if (!settings_ensure_kexploit()) {
-                log_user("[FAIL] Kernel primitives not acquired. Please wait or retry.\n");
+                log_user("[FAIL] Kernel primitives not acquired. Please retry.\n");
                 log_session_end();
                 return;
             }
@@ -4277,67 +4298,76 @@ static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *ver
                     settings_destroy_springboard_remote_call_locked_internal("switching to installd", NO);
                 }
                 
-                log_user("[BLOCK] Waking up installd via IXAppInstallCoordinator (ObjC)...\n");
-                if (init_remote_call("SpringBoard", false) == 0) {
-                    uint64_t fwPath = downgrade_remote_alloc_str("/System/Library/PrivateFrameworks/InstallCoordination.framework/InstallCoordination");
-                    do_remote_call_stable(1000, "dlopen", fwPath, 9, 0, 0, 0, 0, 0, 0);
-                    do_remote_call_stable(1000, "free", fwPath, 0, 0, 0, 0, 0, 0, 0);
-                    
-                    uint64_t ixClass = remote_objc_getClass("IXAppInstallCoordinator");
-                    if (ixClass) {
-                        uint64_t nsstringClass = remote_objc_getClass("NSString");
-                        uint64_t stringWithUTF8Sel = remote_sel_registerName("stringWithUTF8String:");
-                        uint64_t cStrPtr = downgrade_remote_alloc_str("com.apple.mobilesafari");
-                        uint64_t bundleStr = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8Sel, cStrPtr, 0, 0, 0, 0, 0);
-                        do_remote_call_stable(1000, "free", cStrPtr, 0, 0, 0, 0, 0, 0, 0);
-                        
-                        uint64_t existingSel = remote_sel_registerName("existingCoordinatorForAppWithBundleID:error:");
-                        do_remote_call_stable(2000, "objc_msgSend", ixClass, existingSel, bundleStr, 0, 0, 0, 0, 0);
-                        log_user("[BLOCK] Synchronous XPC ping dispatched to installd.\n");
-                    } else {
-                        log_user("[WARN] IXAppInstallCoordinator class not found.\n");
+                // 全英文强提示用户操作
+                log_user("\n==================================================\n");
+                log_user("[ACTION REQUIRED] The 'installd' daemon is asleep.\n");
+                log_user("Please switch to the App Store and start downloading ANY app to wake it up.\n");
+                log_user("Keep this app in the background. Once the download starts, return here.\n");
+                log_user("Waiting for installd process to appear...\n");
+                log_user("==================================================\n\n");
+                
+                int retryCount = 0;
+                // 轮询等待用户在 App Store 触发 installd
+                while (init_remote_call("installd", false) != 0) {
+                    sleep(2); // 每2秒试一次
+                    retryCount++;
+                    if (retryCount % 5 == 0) {
+                        log_user("[WAIT] Still waiting... Go to App Store and tap 'Get' or 'Download' on any app.\n");
                     }
-                    destroy_remote_call();
-                } else {
-                    log_user("[WARN] SpringBoard attach failed. installd might not wake up.\n");
+                    if (retryCount > 60) { // 120秒超时
+                        log_user("[FAIL] Timeout waiting for installd to wake up.\n");
+                        log_session_end();
+                        return;
+                    }
                 }
                 
-                usleep(1500000); 
-                log_user("[BLOCK] installd should be fully awake now.\n");
+                log_user("[OK] 'installd' has been successfully hooked!\n");
+                log_user("[BLOCK] Applying placeholders...\n");
                 
-                log_user("[BLOCK] Attaching to 'installd' to bypass POSIX restrictions...\n");
-                if (init_remote_call("installd", false) == 0) {
+                // 遍历用户勾选的应用，执行目录修改
+                for (NSString *bundleId in self.waitingApps) {
+                    NSDictionary *targetAppInfo = nil;
+                    for (NSDictionary *info in self.apps) {
+                        if ([info[@"CFBundleIdentifier"] isEqualToString:bundleId]) {
+                            targetAppInfo = info;
+                            break;
+                        }
+                    }
+                    
+                    if (!targetAppInfo) continue;
+                    NSString *appName = targetAppInfo[@"CFBundleDisplayName"] ?: targetAppInfo[@"CFBundleName"] ?: bundleId;
+                    NSString *bundlePath = targetAppInfo[@"AppBundlePath"];
+                    NSString *appGroupPath = [bundlePath stringByDeletingLastPathComponent];
+                    NSString *placeholderPath = [appGroupPath stringByAppendingPathComponent:@"com.apple.mobileinstallation.placeholder"];
+                    
+                    BOOL isAlreadyBlocked = (access(placeholderPath.UTF8String, F_OK) == 0);
+                    
                     uint64_t pathPtr = downgrade_remote_alloc_str(placeholderPath.UTF8String);
                     if (pathPtr) {
-                        if (isBlocked) {
-                            log_user("[BLOCK] Current state: Blocked. Attempting to unblock...\n");
+                        if (isAlreadyBlocked) {
                             do_remote_call_stable(1000, "chmod", pathPtr, 0755, 0, 0, 0, 0, 0, 0);
                             uint64_t ret = do_remote_call_stable(1000, "rmdir", pathPtr, 0, 0, 0, 0, 0, 0, 0);
-                            if (ret == 0) log_user("[OK] Successfully unblocked updates for %s.\n", appName.UTF8String);
-                            else log_user("[FAIL] rmdir failed with code %llu. Directory might not be empty.\n", ret);
+                            if (ret == 0) log_user("[OK] Unblocked updates for: %s\n", appName.UTF8String);
+                            else log_user("[WARN] Failed to unblock %s (Code: %llu)\n", appName.UTF8String, ret);
                         } else {
-                            log_user("[BLOCK] Current state: Unblocked. Attempting to block updates...\n");
                             uint64_t ret = do_remote_call_stable(1000, "mkdir", pathPtr, 0755, 0, 0, 0, 0, 0, 0);
                             do_remote_call_stable(1000, "chmod", pathPtr, 0000, 0, 0, 0, 0, 0, 0);
-                            if (ret == 0) log_user("[OK] Successfully blocked updates for %s.\n", appName.UTF8String);
-                            else log_user("[FAIL] mkdir failed with code %llu.\n", ret);
+                            if (ret == 0) log_user("[OK] Blocked updates for: %s\n", appName.UTF8String);
+                            else log_user("[WARN] Failed to block %s (Code: %llu)\n", appName.UTF8String, ret);
                         }
                         do_remote_call_stable(1000, "free", pathPtr, 0, 0, 0, 0, 0, 0, 0);
-                    } else {
-                        log_user("[FAIL] Failed to allocate memory in installd.\n");
                     }
-                    destroy_remote_call();
-                } else {
-                    log_user("[FAIL] Could not attach to installd daemon. It might still be asleep.\n");
                 }
+                destroy_remote_call();
             }
             
+            log_user("[DONE] Operation completed successfully.\n");
             log_session_end();
             
             dispatch_async(dispatch_get_main_queue(), ^{
-                UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-                [feedback impactOccurred];
-                [self.tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationFade];
+                // 处理完成后，清空等待队列并刷新列表
+                [self.waitingApps removeAllObjects];
+                [self.tableView reloadData];
                 [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification object:nil];
             });
         });
